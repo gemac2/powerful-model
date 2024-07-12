@@ -14,6 +14,12 @@ ideal_volumen = 50000000
 variation = 5  # Variation in the last 30 minutes on percentage
 variation_100 = 7  # Variation in the last 30 minutes on percentage while the currency has lower volumen 100k 
 fast_variation = 2  # Variation in the last 2 minutes on percentage
+last_signal_time = {}
+timeframe_wait_times = {
+    "5 Minutes": 300,
+    "1 Hour": 3600,
+    "4 Hours": 14400
+}
 
 client = Client('', '', tld='com')
 
@@ -39,16 +45,41 @@ def search_ticks():
 
 def get_klines(tick):
     try:
-        klines = client.futures_klines(symbol=tick, interval=Client.KLINE_INTERVAL_5MINUTE, limit=48)
+        klines = client.futures_klines(symbol=tick, interval=Client.KLINE_INTERVAL_5MINUTE, limit=48, timeout=30)
+        timeframe = "5 Minutes"
     except Exception as e:
-        print(f"Error while get data for klines  {tick}: {e}")
-        return None
+        print(f"Error while getting data for {tick} 5 minutes klines: {e}")
+        return None, None
 
-    return klines
+    return klines, timeframe
+
+def get_klines_one_hour(tick):
+    try:
+        klines = client.futures_klines(symbol=tick, interval=Client.KLINE_INTERVAL_1HOUR, limit=48, timeout=30)
+        timeframe = "1 Hour"
+    except Exception as e:
+        print(f"Error while getting data for {tick} 1-hour klines: {e}")
+        return None, None
+
+    return klines, timeframe
+
+def get_klines_four_hour(tick):
+    try:
+        klines = client.futures_klines(symbol=tick, interval=Client.KLINE_INTERVAL_4HOUR, limit=48, timeout=30)
+        timeframe = "4 Hours"
+    except Exception as e:
+        print(f"Error while getting data for {tick} 4-hour klines: {e}")
+        return None, None
+
+    return klines, timeframe
 
 def get_movement_alert_klines(tick):
-    klines = client.futures_klines(symbol=tick, interval=Client.KLINE_INTERVAL_1MINUTE, limit=30)
-    return klines
+    try:
+        klines = client.futures_klines(symbol=tick, interval=Client.KLINE_INTERVAL_1MINUTE, limit=30)
+        timeframe = "1 Minute"
+    except Exception as e:
+        return None, None
+    return klines, timeframe
 
 def get_info_ticks(tick):
     try:
@@ -68,7 +99,7 @@ def human_format(volumen):
     return '%.2f%s' % (volumen, ['', 'K', 'M', 'G', 'T', 'P'][magnitude])
 
 
-def get_powerful_patron_signals(tick, klines):
+def get_powerful_patron_signals(tick, klines, timeframe):
     # Calculate RSI Value
     df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
@@ -78,34 +109,40 @@ def get_powerful_patron_signals(tick, klines):
     rsi = RSIIndicator(df['close']).rsi().iloc[-1]
     if rsi == 100:
         return
+    
+    wait_time = timeframe_wait_times.get(timeframe, None)
+    if wait_time is None:
+        print(f"Timeframe not found: {timeframe}")
+        return False
+    
+    if tick not in last_signal_time or (time.time() - last_signal_time[tick]) > wait_time:
+        # Bollinger Bands
+        bb = BollingerBands(df['close'], window=20, window_dev=bollinger_deviation)
+        upper_band = bb.bollinger_hband()
+        lower_band = bb.bollinger_lband()
 
-    # Bollinger Bands
-    bb = BollingerBands(df['close'], window=20, window_dev=bollinger_deviation)
-    upper_band = bb.bollinger_hband()
-    lower_band = bb.bollinger_lband()
+        close_price = df['close'].iloc[-1]
 
-    close_price = df['close'].iloc[-1]
+        # LONG signal
+        if close_price <= lower_band.iloc[-1] and rsi <= rsi_oversold_threshold:
+            info = get_info_ticks(tick)
+            volumen = float(info['quoteVolume'])
+            if  volumen >= ideal_volumen:
+                send_telegram_message("⚠️ Powerful Patron", timeframe, "Possible Long", tick, human_format(volumen), rsi, info['lastPrice'], info['highPrice'], info['lowPrice'], False)
+                return True
 
-    # LONG signal
-    if close_price <= lower_band.iloc[-1] and rsi <= rsi_oversold_threshold:
-        info = get_info_ticks(tick)
-        volumen = float(info['quoteVolume'])
-        if  volumen >= ideal_volumen:
-            send_telegram_message("⚠️ Powerful Patron", "Possible Long", tick, human_format(volumen), rsi, info['lastPrice'], info['highPrice'], info['lowPrice'], False)
-            return True
-
-    # SHORT signal
-    elif close_price >= upper_band.iloc[-1] and rsi >= rsi_overbought_threshold:
-        info = get_info_ticks(tick)
-        volumen = float(info['quoteVolume'])
-        if  volumen >= ideal_volumen:
-            send_telegram_message("⚠️ Powerful Patron", "Possible Short", tick, human_format(volumen), rsi, info['lastPrice'], info['highPrice'], info['lowPrice'], False)
-            return True
+        # SHORT signal
+        elif close_price >= upper_band.iloc[-1] and rsi >= rsi_overbought_threshold:
+            info = get_info_ticks(tick)
+            volumen = float(info['quoteVolume'])
+            if  volumen >= ideal_volumen:
+                send_telegram_message("⚠️ Powerful Patron", timeframe, "Possible Short", tick, human_format(volumen), rsi, info['lastPrice'], info['highPrice'], info['lowPrice'], False)
+                return True
     
     return False
    
 
-def get_movement_alerts(tick, klines, knumber):
+def get_movement_alerts(tick, klines, knumber, timeframe):
     inicial = float(klines[0][4])
     final = float(klines[knumber][4])
 
@@ -116,7 +153,7 @@ def get_movement_alerts(tick, klines, knumber):
             info = get_info_ticks(tick)
             volumen = float(info['quoteVolume'])
             if volumen > 100000000 or result >= variation_100:
-                send_telegram_message("⚠️ Movement Alert", "Possible Long", tick, human_format(volumen), str(result) + '%', info['lastPrice'], info['highPrice'], info['lowPrice'], True)
+                send_telegram_message("⚠️ Movement Alert", timeframe, "Possible Long", tick, human_format(volumen), str(result) + '%', info['lastPrice'], info['highPrice'], info['lowPrice'], True)
                 return True
                 
 
@@ -127,7 +164,7 @@ def get_movement_alerts(tick, klines, knumber):
             info = get_info_ticks(tick)
             volumen = float(info['quoteVolume'])
             if volumen > 100000000 or result >= variation_100:
-                send_telegram_message("⚠️ Movement Alert", "Possible Short", tick, human_format(volumen), str(result) + '%', info['lastPrice'], info['highPrice'], info['lowPrice'], True)
+                send_telegram_message("⚠️ Movement Alert", timeframe, "Possible Short", tick, human_format(volumen), str(result) + '%', info['lastPrice'], info['highPrice'], info['lowPrice'], True)
                 return True
 
     # FAST
@@ -139,13 +176,14 @@ def get_movement_alerts(tick, klines, knumber):
             if result >= fast_variation:
                 info = get_info_ticks(tick)
                 volumen = float(info['quoteVolume'])
-                send_telegram_message("⚡️⚡️Fast Short", "Possible Short", tick, human_format(volumen), str(result) + '%', info['lastPrice'], info['highPrice'], info['lowPrice'], True)
+                send_telegram_message("⚡️⚡️Fast Short", timeframe, "Possible Short", tick, human_format(volumen), str(result) + '%', info['lastPrice'], info['highPrice'], info['lowPrice'], True)
                 return True
     return False
 
-def send_telegram_message(title, order_type, currency_name, volume, rsi_variation, last_price, high_price, low_price, has_variation):
+def send_telegram_message(title, timeframe, order_type, currency_name, volume, rsi_variation, last_price, high_price, low_price, has_variation):
     url = f"https://api.telegram.org/bot{telegram_bot_token}/sendMessage"
     message = f"**{title}**\n\n"
+    message += f"⌛️ TimeFrame: {timeframe}\n\n"
     message += f"🛍️ Order: {order_type}\n\n"
     message += f"🪙 Pair: {currency_name}\n\n"
     message += f"📊 Vol: {volume}\n\n"
@@ -171,22 +209,41 @@ while True:
     print('Scanning Currencies...')
     print('')
     for tick in ticks:
-        klines = get_klines(tick)
-        if klines is None:
-            continue
+        klines_5m, time5m = get_klines(tick)
+        if klines_5m is not None and time5m is not None:
+            found_signal_powerful = get_powerful_patron_signals(tick, klines_5m, time5m)
+            if found_signal_powerful:
+                print("Found powerful patron signal for", tick, "on 5 minutes timeframe")
+                print('**************************************************')
+                print('')
+        
+        klines_1h, time1h = get_klines_one_hour(tick)
+        if klines_1h is not None and time1h is not None:
+            found_signal_bollinger = get_powerful_patron_signals(tick, klines_1h, time1h)
+            if found_signal_bollinger:
+                print("Found powerful patron signal for", tick, "on 1-hour timeframe")
+                print('**************************************************')
+                print('')
+            
+        klines_4h, time4h = get_klines_four_hour(tick)
+        if klines_4h is not None and time4h is not None:
+            found_signal_bollinger = get_powerful_patron_signals(tick, klines_4h, time4h)
+            if found_signal_bollinger:
+                print("Found powerful patron signal for", tick, "on 4-hour timeframe")
+                print('**************************************************')
+                print('')
 
-        found_signal_powerful = get_powerful_patron_signals(tick, klines)
-        movement_klines = get_movement_alert_klines(tick)
+        movement_klines, timeframe = get_movement_alert_klines(tick)
         knumber = len(movement_klines)
 
         if knumber > 0:
             knumber = knumber - 1
-            found_signal_movement = get_movement_alerts(tick, movement_klines, knumber)
-
-        if found_signal_powerful or found_signal_movement:
-            print("Found signal for", tick)
-            print('**************************************************')
-            print('')
+            if movement_klines is not None and timeframe is not None:
+                found_signal_movement = get_movement_alerts(tick, movement_klines, knumber, timeframe)
+                if found_signal_movement:
+                    print("Found movement signal for", tick)
+                    print('**************************************************')
+                    print('')
     print('Waiting 30 seconds...')
     print('')
     time.sleep(30)
